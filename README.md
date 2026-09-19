@@ -4,6 +4,8 @@ Some networks treat Tailscale as a VPN and will block the whole machine if they 
 
 Unknown networks keep Tailscale off. Mark the ones you trust.
 
+![Tailnet Guard](screenshots/panel.png)
+
 ## Install
 
 Requires [Tailscale](https://tailscale.com) and NetworkManager (`nmcli`). The plugin installs a **user** systemd unit only — no root, no sudoers.
