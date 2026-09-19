@@ -1,0 +1,17 @@
+[Unit]
+Description=Hold Tailscale down on untrusted Wi-Fi
+After=dbus.socket
+Wants=dbus.socket
+ConditionPathExists=%h/.config/omarchy/plugins/hlince.tailnet-guard/bin/tailnet-guard
+
+[Service]
+Type=simple
+ExecStart=%h/.config/omarchy/plugins/hlince.tailnet-guard/bin/tailnet-guard run
+Restart=always
+RestartSec=1
+TimeoutStopSec=8
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
+WantedBy=graphical-session-pre.target

@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "hlince.tailnet-guard",
+  "name": "Tailnet Guard",
+  "version": "1.0.0",
+  "author": "Howard Lince III",
+  "homepage": "https://github.com/Howard3/omarchy-tailnet-guard",
+  "license": "MIT",
+  "description": "Map Wi-Fi networks to whether Tailscale is safe, and take Tailscale down between networks before a hostile one can see it.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Tailnet Guard",
+    "description": "Hold Tailscale down on untrusted Wi-Fi, and take it down as soon as you leave a network.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

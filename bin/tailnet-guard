@@ -1,0 +1,602 @@
+#!/usr/bin/env bash
+# Map the current network to whether Tailscale is safe to run.
+# Fail closed: Tailscale is down while roaming, asleep, or on an unknown network.
+
+set -euo pipefail
+
+PLUGIN_ID="hlince.tailnet-guard"
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_PATH="${TAILNET_GUARD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/tailnet-guard.json}"
+STATE_DIR="${TAILNET_GUARD_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/tailnet-guard}"
+STATUS_PATH="$STATE_DIR/status.json"
+LOCK_PATH="$STATE_DIR/daemon.lock"
+UNIT_NAME="hlince-tailnet-guard.service"
+UNIT_SRC="$PLUGIN_DIR/systemd/$UNIT_NAME"
+UNIT_DST="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT_NAME"
+
+mkdir -p "$(dirname "$CONFIG_PATH")" "$STATE_DIR"
+
+SLEEP_FLAG="$STATE_DIR/sleeping"
+NOTIFY_KEY_PATH="$STATE_DIR/last-notify"
+
+usage() {
+  cat <<'EOF'
+Usage: tailnet-guard <command> [args]
+
+  run                 Watch Wi-Fi/sleep and apply policy (fail closed)
+  apply               Apply policy once
+  decide              Print the policy decision as JSON
+  identity            Print the current network identity as JSON
+  status              Print the last written status JSON
+  allow [--current|<name>]
+  deny  [--current|<name>]
+  forget <name>
+  set-default <deny|allow>
+  install-service     Install and start the systemd --user unit
+  uninstall-service   Stop and disable the systemd --user unit
+
+Environment:
+  TAILNET_GUARD_CONFIG         Config JSON path
+  TAILNET_GUARD_STATE          State directory
+  TAILNET_GUARD_IDENTITY_JSON  Skip live detection (tests)
+  TAILNET_GUARD_CONFIG_JSON    Skip reading the config file (tests)
+  TAILNET_GUARD_DRY_RUN        If set, do not call tailscale
+EOF
+}
+
+json_escape() {
+  jq -n --arg s "${1-}" '$s'
+}
+
+ensure_config() {
+  if [[ -n ${TAILNET_GUARD_CONFIG_JSON+x} ]]; then
+    return 0
+  fi
+  if [[ ! -f $CONFIG_PATH ]]; then
+    cat >"$CONFIG_PATH" <<'JSON'
+{
+  "version": 1,
+  "defaultPolicy": "deny",
+  "safe": [],
+  "unsafe": [],
+  "notify": true
+}
+JSON
+  fi
+}
+
+read_config() {
+  if [[ -n ${TAILNET_GUARD_CONFIG_JSON+x} ]]; then
+    printf '%s' "$TAILNET_GUARD_CONFIG_JSON"
+    return 0
+  fi
+  ensure_config
+  jq -c '
+    . as $c
+    | {
+        version: ($c.version // 1),
+        defaultPolicy: (if ($c.defaultPolicy // "deny") == "allow" then "allow" else "deny" end),
+        safe: (($c.safe // []) | map(select(type == "string" and . != ""))),
+        unsafe: (($c.unsafe // []) | map(select(type == "string" and . != ""))),
+        notify: ($c.notify != false)
+      }
+  ' "$CONFIG_PATH" 2>/dev/null || printf '%s' '{"version":1,"defaultPolicy":"deny","safe":[],"unsafe":[],"notify":true}'
+}
+
+write_config_json() {
+  local json=$1 tmp
+  tmp="$(mktemp "$STATE_DIR/config.XXXXXX")"
+  printf '%s\n' "$json" | jq '.' >"$tmp"
+  mv "$tmp" "$CONFIG_PATH"
+}
+
+current_name_from_identity() {
+  local identity=$1
+  jq -r '
+    if (.ssid // "") != "" then .ssid
+    elif (.connection // "") != "" then .connection
+    else empty
+    end
+  ' <<<"$identity"
+}
+
+collect_identity() {
+  if [[ -n ${TAILNET_GUARD_IDENTITY_JSON+x} ]]; then
+    printf '%s' "$TAILNET_GUARD_IDENTITY_JSON"
+    return 0
+  fi
+
+  if [[ -f $SLEEP_FLAG ]]; then
+    printf '%s' '{"phase":"sleeping","kind":"none","ssid":"","connection":"","device":""}'
+    return 0
+  fi
+
+  if ! command -v nmcli >/dev/null 2>&1; then
+    printf '%s' '{"phase":"disconnected","kind":"none","ssid":"","connection":"","device":""}'
+    return 0
+  fi
+
+  local line device type state connection
+  local wifi_connecting=0
+  local default_dev=""
+  local wifi_dev="" wifi_con="" wifi_state=""
+  local eth_dev="" eth_con="" eth_state=""
+
+  default_dev="$(ip -4 route show default 2>/dev/null | awk '/^default/ {for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
+  if [[ $default_dev == tailscale0 || $default_dev == tun* ]]; then
+    default_dev=""
+  fi
+
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    device=${line%%:*}
+    rest=${line#*:}
+    type=${rest%%:*}
+    rest=${rest#*:}
+    state=${rest%%:*}
+    connection=${rest#*:}
+
+    case $type in
+      wifi)
+        case $state in
+          connecting|disconnecting|deactivating|preparing|config|need-auth|ip-config|ip-check|secondaries)
+            wifi_connecting=1
+            ;;
+          connected)
+            if [[ -z $wifi_dev || $device == "$default_dev" ]]; then
+              wifi_dev=$device
+              wifi_con=$connection
+              wifi_state=$state
+            fi
+            ;;
+        esac
+        ;;
+      ethernet)
+        if [[ $state == connected ]]; then
+          if [[ -z $eth_dev || $device == "$default_dev" ]]; then
+            eth_dev=$device
+            eth_con=$connection
+            eth_state=$state
+          fi
+        fi
+        ;;
+    esac
+  done < <(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>/dev/null || true)
+
+  if (( wifi_connecting )); then
+    jq -n \
+      --arg device "$wifi_dev" \
+      --arg connection "$wifi_con" \
+      '{phase:"connecting", kind:"wifi", ssid:"", connection:$connection, device:$device}'
+    return 0
+  fi
+
+  local kind="" device_out="" connection_out="" ssid="" phase="disconnected"
+
+  if [[ -n $wifi_dev ]]; then
+    kind="wifi"
+    device_out=$wifi_dev
+    connection_out=$wifi_con
+    phase="connected"
+    if [[ -n $wifi_con ]]; then
+      ssid="$(nmcli -g 802-11-wireless.ssid connection show "$wifi_con" 2>/dev/null || true)"
+    fi
+    ssid=${ssid%$'\n'}
+  elif [[ -n $eth_dev ]]; then
+    kind="ethernet"
+    device_out=$eth_dev
+    connection_out=$eth_con
+    phase="connected"
+  fi
+
+  jq -n \
+    --arg phase "$phase" \
+    --arg kind "$kind" \
+    --arg ssid "$ssid" \
+    --arg connection "$connection_out" \
+    --arg device "$device_out" \
+    '{phase:$phase, kind:$kind, ssid:$ssid, connection:$connection, device:$device}'
+}
+
+decide_json() {
+  local identity=$1 config=$2
+  jq -n --argjson identity "$identity" --argjson config "$config" '
+    def nonempty: map(select(. != null and . != ""));
+    def names:
+      [($identity.ssid // ""), ($identity.connection // "")] | nonempty;
+    def in_list($list):
+      any(names[]; . as $n | (($list // []) | index($n)) != null);
+    def network:
+      if ($identity.ssid // "") != "" then $identity.ssid
+      else ($identity.connection // "")
+      end;
+
+    (if ($identity.phase // "") == "sleeping" then
+      {decision:"down", reason:"sleeping", safe:false, message:"Sleeping — Tailscale held down"}
+    elif ($identity.phase // "") != "connected" then
+      {decision:"down", reason:"between-networks", safe:false, message:"Between networks — Tailscale held down"}
+    elif in_list($config.unsafe) then
+      {decision:"down", reason:"unsafe-network", safe:false, message:"Blocked network — Tailscale held down"}
+    elif in_list($config.safe) then
+      {decision:"up", reason:"safe-network", safe:true, message:"Trusted network — Tailscale allowed"}
+    elif ($config.defaultPolicy // "deny") == "allow" then
+      {decision:"up", reason:"default-allow", safe:true, message:"Unknown network — allowed by default"}
+    else
+      {decision:"down", reason:"unknown-deny", safe:false, message:"Unknown network — Tailscale held down"}
+    end)
+    + {network: network}
+  '
+}
+
+tailscale_backend() {
+  if ! command -v tailscale >/dev/null 2>&1; then
+    printf '%s' "missing"
+    return 0
+  fi
+  local raw
+  raw="$(timeout 5 tailscale status --json 2>/dev/null || true)"
+  if [[ -z $raw ]]; then
+    printf '%s' "unknown"
+    return 0
+  fi
+  jq -r '.BackendState // "unknown"' <<<"$raw" 2>/dev/null || printf '%s' "unknown"
+}
+
+tailscale_want_running() {
+  if ! command -v tailscale >/dev/null 2>&1; then
+    printf '%s' "false"
+    return 0
+  fi
+  local raw
+  raw="$(timeout 5 tailscale debug prefs 2>/dev/null || true)"
+  if [[ -z $raw ]]; then
+    printf '%s' "unknown"
+    return 0
+  fi
+  jq -r 'if .WantRunning == true then "true" else "false" end' <<<"$raw" 2>/dev/null || printf '%s' "unknown"
+}
+
+do_tailscale_down() {
+  : >"$STATE_DIR/force-down"
+  if [[ -n ${TAILNET_GUARD_DRY_RUN-} ]]; then
+    return 0
+  fi
+  command -v tailscale >/dev/null 2>&1 || return 0
+  timeout 8 tailscale down >/dev/null 2>&1 || timeout 8 tailscale down || true
+}
+
+do_tailscale_up() {
+  if [[ -f $STATE_DIR/force-down ]]; then
+    return 0
+  fi
+  if [[ -n ${TAILNET_GUARD_DRY_RUN-} ]]; then
+    return 0
+  fi
+  command -v tailscale >/dev/null 2>&1 || return 0
+  local backend
+  backend="$(tailscale_backend)"
+  if [[ $backend == NeedsLogin || $backend == NoState ]]; then
+    return 0
+  fi
+  timeout 15 tailscale up >/dev/null 2>&1 || timeout 15 tailscale up || true
+  if [[ -f $STATE_DIR/force-down ]]; then
+    timeout 8 tailscale down >/dev/null 2>&1 || timeout 8 tailscale down || true
+  fi
+}
+
+write_status() {
+  local identity=$1 decision=$2 backend=${3:-unknown}
+  local tmp
+  tmp="$(mktemp "$STATE_DIR/status.XXXXXX")"
+  jq -n \
+    --argjson identity "$identity" \
+    --argjson decision "$decision" \
+    --arg backend "$backend" \
+    --arg updated "$(date --iso-8601=seconds)" \
+    --arg daemon "running" \
+    '{
+      version: 1,
+      updatedAt: $updated,
+      daemon: $daemon,
+      phase: ($identity.phase // "disconnected"),
+      kind: ($identity.kind // "none"),
+      ssid: ($identity.ssid // ""),
+      connection: ($identity.connection // ""),
+      device: ($identity.device // ""),
+      decision: ($decision.decision // "down"),
+      reason: ($decision.reason // "between-networks"),
+      reasonText: ($decision.message // ""),
+      network: ($decision.network // ""),
+      safe: ($decision.safe == true),
+      tailscale: $backend
+    }' >"$tmp"
+  mv "$tmp" "$STATUS_PATH"
+}
+
+notify_transition() {
+  local config=$1 decision=$2
+  local notify network reason message action
+  notify="$(jq -r '.notify != false' <<<"$config")"
+  [[ $notify == true ]] || return 0
+
+  reason="$(jq -r '.reason' <<<"$decision")"
+  network="$(jq -r '.network' <<<"$decision")"
+  message="$(jq -r '.message' <<<"$decision")"
+  action="$(jq -r '.decision' <<<"$decision")"
+
+  case $reason in
+    between-networks|sleeping) return 0 ;;
+  esac
+
+  local key="$action|$reason|$network"
+  if [[ -f $NOTIFY_KEY_PATH && $(cat "$NOTIFY_KEY_PATH") == "$key" ]]; then
+    return 0
+  fi
+  printf '%s\n' "$key" >"$NOTIFY_KEY_PATH"
+
+  local headline="Tailscale held down"
+  if [[ $action == up ]]; then
+    headline="Tailscale allowed"
+  fi
+
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send --app-name "Tailnet Guard" -g $'\uf49e' -u normal "$headline" "$message" || true
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send --app-name "Tailnet Guard" "$headline" "$message" || true
+  fi
+}
+
+apply_once() {
+  local mode=${1:-full}
+  local config identity decision backend action
+
+  config="$(read_config)"
+
+  if [[ $mode == fast ]]; then
+    identity='{"phase":"connecting","kind":"wifi","ssid":"","connection":"","device":""}'
+  else
+    identity="$(collect_identity)"
+  fi
+
+  decision="$(decide_json "$identity" "$config")"
+  action="$(jq -r '.decision' <<<"$decision")"
+
+  if [[ $action == down ]]; then
+    do_tailscale_down
+  else
+    rm -f "$STATE_DIR/force-down"
+    do_tailscale_up
+  fi
+
+  if [[ $mode == fast ]]; then
+    backend="stopping"
+  else
+    backend="$(tailscale_backend)"
+  fi
+  write_status "$identity" "$decision" "$backend"
+  notify_transition "$config" "$decision"
+}
+
+apply_locked() {
+  local mode=${1:-full}
+  mkdir -p "$STATE_DIR"
+  # Down never waits on the policy lock. A slow `tailscale up` must not
+  # delay taking the interface down while roaming onto a hostile network.
+  if [[ $mode == fast ]]; then
+    do_tailscale_down
+  fi
+  exec 9>"$LOCK_PATH"
+  if ! flock -n 9; then
+    printf '%s\n' "$mode" >"$STATE_DIR/dirty"
+    return 0
+  fi
+  while true; do
+    rm -f "$STATE_DIR/dirty"
+    apply_once "$mode"
+    if [[ ! -f $STATE_DIR/dirty ]]; then
+      break
+    fi
+    mode=$(cat "$STATE_DIR/dirty" 2>/dev/null || printf '%s' full)
+    [[ $mode == fast || $mode == full ]] || mode=full
+  done
+}
+
+resolve_target_name() {
+  local arg=${1-}
+  if [[ -z $arg || $arg == --current ]]; then
+    current_name_from_identity "$(collect_identity)"
+    return 0
+  fi
+  printf '%s' "$arg"
+}
+
+mutate_lists() {
+  local action=$1 name=$2
+  [[ -n $name ]] || { echo "tailnet-guard: no network name" >&2; return 1; }
+  local config
+  config="$(read_config)"
+  config="$(jq -c --arg action "$action" --arg name "$name" '
+    .safe = (.safe // [])
+    | .unsafe = (.unsafe // [])
+    | if $action == "allow" then
+        .safe = ((.safe - [$name]) + [$name])
+        | .unsafe = (.unsafe - [$name])
+      elif $action == "deny" then
+        .unsafe = ((.unsafe - [$name]) + [$name])
+        | .safe = (.safe - [$name])
+      elif $action == "forget" then
+        .safe = (.safe - [$name])
+        | .unsafe = (.unsafe - [$name])
+      else .
+      end
+  ' <<<"$config")"
+  write_config_json "$config"
+  apply_locked full
+}
+
+set_default_policy() {
+  local policy=$1
+  [[ $policy == deny || $policy == allow ]] || { echo "tailnet-guard: default policy must be deny or allow" >&2; return 1; }
+  local config
+  config="$(read_config)"
+  config="$(jq -c --arg policy "$policy" '.defaultPolicy = $policy' <<<"$config")"
+  write_config_json "$config"
+  apply_locked full
+}
+
+install_service() {
+  mkdir -p "$(dirname "$UNIT_DST")"
+  cat >"$UNIT_DST" <<UNIT
+[Unit]
+Description=Hold Tailscale down on untrusted Wi-Fi
+Documentation=file://$PLUGIN_DIR/README.md
+After=dbus.socket
+Wants=dbus.socket
+ConditionPathExists=$PLUGIN_DIR/bin/tailnet-guard
+
+[Service]
+Type=simple
+ExecStart=$PLUGIN_DIR/bin/tailnet-guard run
+Restart=always
+RestartSec=1
+TimeoutStopSec=8
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
+WantedBy=graphical-session-pre.target
+UNIT
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$UNIT_NAME"
+}
+
+uninstall_service() {
+  systemctl --user disable --now "$UNIT_NAME" 2>/dev/null || true
+  rm -f "$UNIT_DST"
+  systemctl --user daemon-reload || true
+}
+
+wifi_in_flux() {
+  command -v nmcli >/dev/null 2>&1 || return 1
+  nmcli -t -f TYPE,STATE device status 2>/dev/null \
+    | grep -E '^wifi:(connecting|disconnecting|deactivating|preparing|config|need-auth|ip-config|ip-check|secondaries)' \
+    >/dev/null
+}
+
+is_fast_iw_line() {
+  local line=$1
+  [[ $line =~ (disconnected|deauth|disassoc|associated|roam) ]]
+}
+
+apply_for_network_event() {
+  if wifi_in_flux; then
+    apply_locked fast || true
+  fi
+  apply_locked full || true
+}
+
+watch_logind() {
+  command -v gdbus >/dev/null 2>&1 || return 0
+  gdbus monitor --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 2>/dev/null \
+    | while IFS= read -r line; do
+        if [[ $line == *PrepareForSleep*true* ]]; then
+          : >"$SLEEP_FLAG"
+          apply_locked fast || true
+        elif [[ $line == *PrepareForSleep*false* ]]; then
+          rm -f "$SLEEP_FLAG"
+          apply_locked fast || true
+          apply_locked full || true
+        fi
+      done
+}
+
+watch_nm() {
+  command -v nmcli >/dev/null 2>&1 || return 0
+  stdbuf -oL nmcli monitor 2>/dev/null | while IFS= read -r _; do
+    apply_for_network_event || true
+  done
+}
+
+watch_iw() {
+  command -v iw >/dev/null 2>&1 || return 0
+  local line
+  stdbuf -oL iw event 2>/dev/null | while IFS= read -r line; do
+    if is_fast_iw_line "$line"; then
+      apply_locked fast || true
+    elif [[ $line == *" connected "* || $line == *": connected to "* ]]; then
+      apply_for_network_event || true
+    fi
+  done
+}
+
+watch_config() {
+  command -v inotifywait >/dev/null 2>&1 || return 0
+  local dir
+  dir="$(dirname "$CONFIG_PATH")"
+  stdbuf -oL inotifywait -m -q -e close_write,moved_to,create --format '%f' "$dir" 2>/dev/null \
+    | while IFS= read -r file; do
+        [[ $file == "$(basename "$CONFIG_PATH")" ]] || continue
+        apply_locked full || true
+      done
+}
+
+run_daemon() {
+  ensure_config
+  rm -f "$SLEEP_FLAG"
+  # Fail closed before we even look at the current SSID: a hostile network
+  # that comes up during login must not see Tailscale from the previous session.
+  apply_locked fast || true
+  apply_locked full || true
+
+  trap 'rm -f "$SLEEP_FLAG"; kill $(jobs -p) 2>/dev/null || true' EXIT INT TERM
+
+  watch_nm &
+  watch_iw &
+  watch_logind &
+  watch_config &
+
+  while true; do
+    apply_locked full || true
+    sleep 5
+  done
+}
+
+cmd=${1:-}
+shift || true
+
+case $cmd in
+  ""|-h|--help) usage ;;
+  run) run_daemon ;;
+  apply) apply_locked full ;;
+  decide)
+    ensure_config
+    decide_json "$(collect_identity)" "$(read_config)"
+    echo
+    ;;
+  identity)
+    collect_identity
+    echo
+    ;;
+  status)
+    if [[ -f $STATUS_PATH ]]; then cat "$STATUS_PATH"; echo; else echo '{}'; fi
+    ;;
+  allow)
+    mutate_lists allow "$(resolve_target_name "${1-}")"
+    ;;
+  deny)
+    mutate_lists deny "$(resolve_target_name "${1-}")"
+    ;;
+  forget)
+    mutate_lists forget "$(resolve_target_name "${1-}")"
+    ;;
+  set-default)
+    set_default_policy "${1-}"
+    ;;
+  install-service) install_service ;;
+  uninstall-service) uninstall_service ;;
+  *)
+    echo "tailnet-guard: unknown command: $cmd" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
