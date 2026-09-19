@@ -35,7 +35,7 @@ Item {
   Process {
     id: activeCheck
     running: false
-    command: ["systemctl", "--user", "is-active", "hlince-tailnet-guard.service"]
+    command: ["systemctl", "--user", "is-active", "howard3-tailnet-guard.service"]
     onExited: function(exitCode) {
       root.systemdActive = exitCode === 0
       if (root.systemdActive) {

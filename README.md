@@ -20,7 +20,7 @@ Then click the shield in the bar (next to Tailscale) and turn on **Allow Tailsca
 - **SSID (or Ethernet connection name) in the trusted list:** `tailscale up`
 - **In the blocked list, or unknown with the default of deny:** stay down
 - Kernel `iw` events fire the down path so roam is not waiting on NetworkManager
-- A systemd `--user` service (`hlince-tailnet-guard.service`) keeps doing this even if the bar restarts
+- A systemd `--user` service (`howard3-tailnet-guard.service`) keeps doing this even if the bar restarts
 
 ## Config
 
@@ -41,9 +41,9 @@ The bar panel can add the current network without editing the file. In the panel
 ## CLI
 
 ```bash
-~/.config/omarchy/plugins/hlince.tailnet-guard/bin/tailnet-guard allow --current
-~/.config/omarchy/plugins/hlince.tailnet-guard/bin/tailnet-guard deny --current
-~/.config/omarchy/plugins/hlince.tailnet-guard/bin/tailnet-guard status
+~/.config/omarchy/plugins/howard3.tailnet-guard/bin/tailnet-guard allow --current
+~/.config/omarchy/plugins/howard3.tailnet-guard/bin/tailnet-guard deny --current
+~/.config/omarchy/plugins/howard3.tailnet-guard/bin/tailnet-guard status
 ```
 
 ## Remove
@@ -51,15 +51,15 @@ The bar panel can add the current network without editing the file. In the panel
 Stop the guard first, then remove the plugin:
 
 ```bash
-~/.config/omarchy/plugins/hlince.tailnet-guard/bin/tailnet-guard uninstall-service
-omarchy plugin remove hlince.tailnet-guard
+~/.config/omarchy/plugins/howard3.tailnet-guard/bin/tailnet-guard uninstall-service
+omarchy plugin remove howard3.tailnet-guard
 ```
 
 If the plugin folder is already gone:
 
 ```bash
-systemctl --user disable --now hlince-tailnet-guard.service
-rm -f ~/.config/systemd/user/hlince-tailnet-guard.service
+systemctl --user disable --now howard3-tailnet-guard.service
+rm -f ~/.config/systemd/user/howard3-tailnet-guard.service
 systemctl --user daemon-reload
 ```
 

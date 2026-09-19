@@ -8,8 +8,8 @@ import qs.Ui
 Panel {
   id: root
 
-  moduleName: "hlince.tailnet-guard"
-  ipcTarget: "hlince.tailnet-guard"
+  moduleName: "howard3.tailnet-guard"
+  ipcTarget: "howard3.tailnet-guard"
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent

@@ -2,11 +2,11 @@
 Description=Hold Tailscale down on untrusted Wi-Fi
 After=dbus.socket
 Wants=dbus.socket
-ConditionPathExists=%h/.config/omarchy/plugins/hlince.tailnet-guard/bin/tailnet-guard
+ConditionPathExists=%h/.config/omarchy/plugins/howard3.tailnet-guard/bin/tailnet-guard
 
 [Service]
 Type=simple
-ExecStart=%h/.config/omarchy/plugins/hlince.tailnet-guard/bin/tailnet-guard run
+ExecStart=%h/.config/omarchy/plugins/howard3.tailnet-guard/bin/tailnet-guard run
 Restart=always
 RestartSec=1
 TimeoutStopSec=8
