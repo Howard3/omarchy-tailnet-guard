@@ -4,9 +4,9 @@ Some networks treat Tailscale as a VPN and will block the whole machine if they 
 
 Unknown networks keep Tailscale off. Mark the ones you trust.
 
-![Tailnet Guard](screenshots/panel.png)
-
 ## Install
+
+**[Tailnet Guard on the Omarchy marketplace](https://plugins.omarchy.org/plugin.html?id=howard3.tailnet-guard)**
 
 Requires [Tailscale](https://tailscale.com) and NetworkManager (`nmcli`). The plugin installs a **user** systemd unit only — no root, no sudoers.
 
@@ -14,7 +14,11 @@ Requires [Tailscale](https://tailscale.com) and NetworkManager (`nmcli`). The pl
 omarchy plugin add https://github.com/Howard3/omarchy-tailnet-guard.git --enable
 ```
 
+That is the marketplace install command. Omarchy clones the current upstream repository, validates it locally, and only then installs and enables the plugin. The command follows the repository’s current HEAD, so check the installed commit before you enable it.
+
 Then click the shield in the bar (next to Tailscale) and turn on **Allow Tailscale here** for networks you trust.
+
+![Tailnet Guard](screenshots/panel.png)
 
 ## Behaviour
 

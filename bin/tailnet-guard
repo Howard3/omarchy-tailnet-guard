@@ -385,20 +385,23 @@ apply_locked() {
   if [[ $mode == fast ]]; then
     do_tailscale_down
   fi
-  exec 9>"$LOCK_PATH"
-  if ! flock -n 9; then
-    printf '%s\n' "$mode" >"$STATE_DIR/dirty"
-    return 0
-  fi
-  while true; do
-    rm -f "$STATE_DIR/dirty"
-    apply_once "$mode"
-    if [[ ! -f $STATE_DIR/dirty ]]; then
-      break
+  # flock lives on the open fd. Take it in a subshell so the daemon and the
+  # watchers forked after startup cannot inherit the lock and hold it forever.
+  (
+    if ! flock -n 9; then
+      printf '%s\n' "$mode" >"$STATE_DIR/dirty"
+      exit 0
     fi
-    mode=$(cat "$STATE_DIR/dirty" 2>/dev/null || printf '%s' full)
-    [[ $mode == fast || $mode == full ]] || mode=full
-  done
+    while true; do
+      rm -f "$STATE_DIR/dirty"
+      apply_once "$mode"
+      if [[ ! -f $STATE_DIR/dirty ]]; then
+        break
+      fi
+      mode=$(cat "$STATE_DIR/dirty" 2>/dev/null || printf '%s' full)
+      [[ $mode == fast || $mode == full ]] || mode=full
+    done
+  ) 9>"$LOCK_PATH"
 }
 
 resolve_target_name() {
@@ -548,7 +551,10 @@ run_daemon() {
   apply_locked fast || true
   apply_locked full || true
 
-  trap 'rm -f "$SLEEP_FLAG"; kill $(jobs -p) 2>/dev/null || true' EXIT INT TERM
+  trap 'rm -f "$SLEEP_FLAG"; kill $(jobs -p) 2>/dev/null || true' EXIT
+  # A caught TERM/INT does not end the shell on its own. Exit so the unit
+  # actually stops instead of swallowing the signal and looping forever.
+  trap 'rm -f "$SLEEP_FLAG"; kill $(jobs -p) 2>/dev/null || true; exit 0' INT TERM
 
   watch_nm &
   watch_iw &
