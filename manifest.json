@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "howard3.tailnet-guard",
   "name": "Tailnet Guard",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Howard Lince III",
   "homepage": "https://github.com/Howard3/omarchy-tailnet-guard",
   "license": "MIT",
